@@ -1,0 +1,6 @@
+artifacts/
+checkpoints/
+data_snapshots/
+study-packages/
+logs/
+.claude/
