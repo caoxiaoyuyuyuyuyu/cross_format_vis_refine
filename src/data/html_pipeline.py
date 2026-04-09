@@ -145,7 +145,7 @@ class HTMLPerturbation:
             if not visible:
                 return None, ""
             tag = random.choice(visible)
-            new_soup = BeautifulSoup(str(soup), "html.parser")
+            new_soup = copy.deepcopy(soup)
             t = _find_matching_tag(new_soup, tag)
             if not t:
                 return None, ""
@@ -157,7 +157,7 @@ class HTMLPerturbation:
         new_val = _random_hex_color()
         while new_val.lower() == old_val.lower():
             new_val = _random_hex_color()
-        new_soup = BeautifulSoup(str(soup), "html.parser")
+        new_soup = copy.deepcopy(soup)
         t = _find_matching_tag(new_soup, tag)
         if not t:
             return None, ""
@@ -181,7 +181,7 @@ class HTMLPerturbation:
             tag = random.choice(visible)
             offset = random.randint(10, 40)
             prop = random.choice(["margin-left", "margin-top", "padding-top"])
-            new_soup = BeautifulSoup(str(soup), "html.parser")
+            new_soup = copy.deepcopy(soup)
             t = _find_matching_tag(new_soup, tag)
             if not t:
                 return None, ""
@@ -189,7 +189,7 @@ class HTMLPerturbation:
             return new_soup, f"Added {prop}: {offset}px to <{tag.name}>"
 
         tag, prop, old_val = random.choice(candidates)
-        new_soup = BeautifulSoup(str(soup), "html.parser")
+        new_soup = copy.deepcopy(soup)
         t = _find_matching_tag(new_soup, tag)
         if not t:
             return None, ""
@@ -247,7 +247,7 @@ class HTMLPerturbation:
             scale = random.uniform(0.5, 1.5)
         new_num = max(1, num * scale)
 
-        new_soup = BeautifulSoup(str(soup), "html.parser")
+        new_soup = copy.deepcopy(soup)
         t = _find_matching_tag(new_soup, tag)
         if not t:
             return None, ""
@@ -274,7 +274,7 @@ class HTMLPerturbation:
             return None, ""
 
         tag = random.choice(candidates)
-        new_soup = BeautifulSoup(str(soup), "html.parser")
+        new_soup = copy.deepcopy(soup)
         t = _find_matching_tag(new_soup, tag)
         if not t:
             return None, ""
@@ -310,7 +310,7 @@ class HTMLPerturbation:
         tag = random.choice(candidates)
         old_text = tag.string.strip()
 
-        new_soup = BeautifulSoup(str(soup), "html.parser")
+        new_soup = copy.deepcopy(soup)
         t = _find_matching_tag(new_soup, tag)
         if not t:
             return None, ""
@@ -368,7 +368,7 @@ class HTMLPerturbation:
             return None, ""
 
         strategy = random.choice(strategies)
-        new_soup = BeautifulSoup(str(soup), "html.parser")
+        new_soup = copy.deepcopy(soup)
 
         CSS_FONTS = ["Arial, sans-serif", "Georgia, serif", "Courier New, monospace",
                      "Verdana, sans-serif", "Times New Roman, serif", "Impact, sans-serif"]
@@ -578,7 +578,9 @@ class HTMLPipeline:
 
         original_html = html_code
         perturbed_html = str(new_soup)
-        if original_html.strip() == perturbed_html.strip():
+        # Normalize whitespace before comparing to avoid BS4 serialization artifacts
+        _ws = lambda s: re.sub(r'\s+', ' ', s).strip()
+        if _ws(original_html) == _ws(perturbed_html):
             return None
 
         try:
