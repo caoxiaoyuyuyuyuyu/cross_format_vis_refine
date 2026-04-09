@@ -47,7 +47,7 @@ class DiffCodeModel(nn.Module):
 
         # DPA module
         vit_hidden_dim = self.base_model.config.vision_config.hidden_size
-        llm_hidden_dim = self.base_model.config.hidden_size
+        llm_hidden_dim = self.base_model.config.text_config.hidden_size
         self.dpa = DifferentialPerceptionAdapter(
             vit_hidden_dim=vit_hidden_dim,
             llm_hidden_dim=llm_hidden_dim,
@@ -56,6 +56,9 @@ class DiffCodeModel(nn.Module):
 
         # Apply LoRA to LLM q/v projections
         self._apply_lora(lora_rank, lora_alpha)
+
+        # Match DPA dtype to base model
+        self.dpa = self.dpa.to(torch.bfloat16)
 
         # Register ViT hooks
         self.register_vit_hooks()
@@ -67,7 +70,7 @@ class DiffCodeModel(nn.Module):
         self.base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
         self.processor = AutoProcessor.from_pretrained(model_name)
 
@@ -98,7 +101,7 @@ class DiffCodeModel(nn.Module):
         self._hook_handles.clear()
         self._hooked_features.clear()
 
-        vit = self.base_model.get_base_model().visual
+        vit = self.base_model.get_base_model().model.visual
 
         for layer_idx in self.hook_layers:
             layer = vit.blocks[layer_idx]
@@ -130,7 +133,7 @@ class DiffCodeModel(nn.Module):
         self._hooked_features.clear()
 
         # Forward through ViT (before spatial merge)
-        vit = self.base_model.get_base_model().visual
+        vit = self.base_model.get_base_model().model.visual
         vit(pixel_values, grid_thw=grid_thw)
 
         # Compute per-image patch counts: seq_len_i = T_i * H_i * W_i
@@ -158,7 +161,7 @@ class DiffCodeModel(nn.Module):
             else:
                 feat_3d = feat
 
-            features[idx] = feat_3d.detach().clone() if not self.training else feat_3d.clone()
+            features[idx] = feat_3d.detach().clone()
 
         return features
 
@@ -188,7 +191,7 @@ class DiffCodeModel(nn.Module):
 
         # Step 3: Get LLM input embeddings and prepend diff tokens
         base_model = self.base_model.get_base_model()
-        text_embeds = base_model.model.embed_tokens(input_ids)  # (B, S_text, D)
+        text_embeds = base_model.model.language_model.embed_tokens(input_ids)  # (B, S_text, D)
         combined_embeds = torch.cat([diff_tokens, text_embeds], dim=1)
 
         # Extend attention mask for diff tokens
@@ -203,11 +206,11 @@ class DiffCodeModel(nn.Module):
             combined_labels = torch.cat([diff_labels, labels], dim=1)
 
         # Step 4: LLM forward
-        outputs = base_model.model(
+        outputs = base_model.model.language_model(
             inputs_embeds=combined_embeds,
             attention_mask=combined_attn,
         )
-        logits = base_model.lm_head(outputs.last_hidden_state)
+        logits = base_model.lm_head(outputs[0])
 
         loss = None
         if combined_labels is not None:

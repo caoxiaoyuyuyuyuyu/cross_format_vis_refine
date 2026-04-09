@@ -1,0 +1,49 @@
+_next_id: 7
+decisions:
+- id: D001
+  date: 2026-04-09 09:02 UTC
+  summary: 立项启动 DiffCode，Phase 0 聚焦数据管线和 DPA 模块实现
+  rationale: Reviewer 四项均 4/5，方向新颖且可行。DPA 架构预定义无搜索成本，80h GPU 预算内可完成全部实验。先搭数据管线（不需
+    GPU），GPU 分配留到训练阶段。目标 AAAI 2027（Jul 25 abstract），时间充裕。
+  related_experiments: []
+  depends_on: []
+- id: D002
+  date: 2026-04-09 09:04 UTC
+  summary: 响应 Reviewer 审查：放弃 EMNLP 备选，增加评估指标体系、Exp-0 pilot 验证、Exp-5 外部 baseline
+  rationale: Reviewer 4 个 warning 均合理：(1) EMNLP May 25 仅剩 46 天不现实；(2) 评估指标需在 Phase
+    0 明确以指导数据管线设计；(3) DPA 架构锁定需 pilot 验证方向再全量投入；(4) 缺外部 baseline 会被 AAAI 审稿人质疑。全部采纳。
+  related_experiments: []
+  depends_on: []
+- id: D003
+  date: 2026-04-09 09:31 UTC
+  summary: Exp-0 pilot 改为 SVG-only ~1K 样本，不等 HTML pipeline
+  rationale: 3 个 Worker 全部失败（ViT hook/eval metrics/HTML pipeline），HTML pipeline 修复时间不确定。SVG
+    pipeline 已就绪，DPA 方向验证不依赖跨格式数据——核心假设是 diff tokens 有信号，单格式即可检验。HTML pipeline 并行开发不阻塞关键路径。
+  related_experiments: []
+  depends_on: []
+- id: D004
+  date: 2026-04-09 10:01 UTC
+  summary: Exp-0 pilot 恢复为完整 2K（1K HTML + 1K SVG），覆盖 D003 的 SVG-only 决策
+  rationale: D003 因 HTML pipeline 未就绪而改 SVG-only。现 HTML pipeline 已完成（第三次尝试成功），恢复完整
+    2K pilot 以验证跨格式能力。
+  related_experiments: []
+  depends_on:
+  - D003
+- id: D005
+  date: 2026-04-09 15:46 UTC
+  summary: 统一 attn_implementation 为 sdpa，取消 flash-attn 依赖
+  rationale: Reviewer 指出 baseline(sdpa) vs DiffCode(flash_attention_2) 不一致，对比实验必须统一注意力实现。选择
+    sdpa：兼容性更好，消除 Blackwell sm_120 上 flash-attn 编译瓶颈。
+  related_experiments: []
+  depends_on:
+  - D004
+- id: D006
+  date: 2026-04-09 16:12 UTC
+  summary: Exp-0 增加 prompt 难度消融：easy(+error_desc) vs hard(-error_desc)，避免 ceiling
+    effect
+  rationale: Reviewer 指出单点扰动+详细 error_description 导致 baseline 首步 loss 极低(0.08)，训练后
+    SSIM 可能触顶，DiffCode 无提升空间。增加 hard 条件（移除 error_description）迫使模型依赖视觉信息，更能验证 DPA 价值。
+  related_experiments: []
+  depends_on:
+  - D004
+  - D005

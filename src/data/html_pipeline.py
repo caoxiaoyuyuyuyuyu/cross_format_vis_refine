@@ -99,13 +99,32 @@ def _find_matching_tag(new_soup: BeautifulSoup, orig_tag: Tag) -> Optional[Tag]:
 # ── Rendering ────────────────────────────────────────────────────────
 
 def render_html_sync(html_code: str, width: int = 1280, height: int = 720) -> Image.Image:
-    """Render HTML to PIL Image via html2image (wkhtmltoimage backend)."""
-    from html2image import Html2Image
+    """Render HTML to PIL Image via wkhtmltoimage (fallback to html2image)."""
+    import subprocess
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        hti = Html2Image(output_path=tmpdir, size=(width, height))
-        hti.screenshot(html_str=html_code, save_as="shot.png")
+        html_path = os.path.join(tmpdir, "input.html")
         img_path = os.path.join(tmpdir, "shot.png")
+        with open(html_path, "w") as f:
+            f.write(html_code)
+        subprocess.run(
+            [
+                "wkhtmltoimage", "--quiet",
+                "--width", str(width), "--height", str(height),
+                "--quality", "90",
+                "--load-error-handling", "ignore",
+                "--load-media-error-handling", "ignore",
+                "--disable-javascript",
+                "--enable-local-file-access",
+                html_path, img_path,
+            ],
+            check=False,
+            timeout=30,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if not os.path.exists(img_path):
+            raise RuntimeError("wkhtmltoimage produced no output")
         return Image.open(img_path).convert("RGB").copy()
 
 
