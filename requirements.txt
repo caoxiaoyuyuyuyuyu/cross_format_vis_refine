@@ -1,0 +1,17 @@
+torch
+torchvision
+torchaudio
+transformers
+peft
+accelerate
+einops
+wandb
+cairosvg
+beautifulsoup4
+Pillow
+scikit-image
+open-clip-torch
+codebleu
+sacrebleu
+html2image
+lxml
