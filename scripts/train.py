@@ -31,17 +31,41 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+TYPE_SPECIFIC_HINTS = {
+    "element": "Focus on DOM structure: check for missing, extra, or reordered elements.",
+    "position": "Focus on element positioning: check coordinates, margins, padding, and offsets.",
+    "size": "Focus on element dimensions: check width, height, and scaling.",
+    "color": "Focus on color values: check hex codes, RGB, and opacity.",
+    "style": "Focus on CSS styling: check font properties, borders, shadows, and decorations.",
+    "text": "Focus on text content: check for typos, missing text, or wrong characters.",
+}
+
+# Prompt modes for ablation:
+#   super-hard: no error info at all
+#   hard: error type label only (current baseline)
+#   hard+hints: error type + type-specific fixing hint
+#   easy: error type + detailed error description
+PROMPT_MODES = ("super-hard", "hard", "hard+hints", "easy")
+
+
 class RefinementDataset(Dataset):
     """Dataset for visual code refinement training.
 
     Loads metadata.json with original/perturbed code pairs and images.
     """
 
-    def __init__(self, data_dir: str, processor, max_length: int = 1024, no_error_description: bool = False):
+    def __init__(self, data_dir: str, processor, max_length: int = 1024,
+                 no_error_description: bool = False, prompt_mode: str = None):
         self.data_dir = Path(data_dir)
         self.processor = processor
         self.max_length = max_length
-        self.no_error_description = no_error_description
+        # prompt_mode takes precedence; fall back to legacy flag
+        if prompt_mode:
+            self.prompt_mode = prompt_mode
+        elif no_error_description:
+            self.prompt_mode = "hard"
+        else:
+            self.prompt_mode = "easy"
 
         metadata_path = self.data_dir / "metadata.json"
         with open(metadata_path) as f:
@@ -71,12 +95,18 @@ class RefinementDataset(Dataset):
         error_type = sample.get("error_type", "unknown")
         error_desc = sample.get("error_description", "")
 
-        prompt = (
-            f"The rendered image does not match the target. "
-            f"Error type: {error_type}."
-        )
-        if error_desc and not self.no_error_description:
-            prompt += f" {error_desc}"
+        prompt = "The rendered image does not match the target."
+        if self.prompt_mode == "super-hard":
+            pass  # no error info
+        elif self.prompt_mode == "hard":
+            prompt += f" Error type: {error_type}."
+        elif self.prompt_mode == "hard+hints":
+            hint = TYPE_SPECIFIC_HINTS.get(error_type, "")
+            prompt += f" Error type: {error_type}. {hint}"
+        else:  # easy
+            prompt += f" Error type: {error_type}."
+            if error_desc:
+                prompt += f" {error_desc}"
         prompt += (
             f"\nCurrent code:\n```\n{perturbed_code}\n```\n"
             f"Fix the code to match the target image. Output only the corrected code."
@@ -194,13 +224,91 @@ def collate_baseline(batch, processor, max_length=1024):
 
 
 def collate_diffcode(batch, processor, max_length=1024):
-    """Collate for DiffCode mode: images processed separately, text-only tokenization."""
+    """Collate for DiffCode mode: VL path (same as baseline) + separate DPA inputs."""
     from qwen_vl_utils import process_vision_info
 
     target_codes = [s["target_code"] for s in batch]
     error_types = [s["error_type"] for s in batch]
 
-    # Process target and rendered images separately
+    # === VL path: same as baseline (both images in conversation) ===
+    full_conversations = []
+    prompt_conversations = []
+    for sample in batch:
+        full_conv = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": sample["target_img"]},
+                    {"type": "image", "image": sample["rendered_img"]},
+                    {"type": "text", "text": sample["prompt"]},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": f"```\n{sample['target_code']}\n```"},
+                ],
+            },
+        ]
+        prompt_conv = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": sample["target_img"]},
+                    {"type": "image", "image": sample["rendered_img"]},
+                    {"type": "text", "text": sample["prompt"]},
+                ],
+            },
+        ]
+        full_conversations.append(full_conv)
+        prompt_conversations.append(prompt_conv)
+
+    full_texts = [
+        processor.apply_chat_template(conv, tokenize=False, add_generation_prompt=False)
+        for conv in full_conversations
+    ]
+    prompt_texts = [
+        processor.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
+        for conv in prompt_conversations
+    ]
+
+    all_images = []
+    for conv in full_conversations:
+        imgs, _ = process_vision_info(conv)
+        if imgs:
+            all_images.extend(imgs)
+
+    inputs = processor(
+        text=full_texts,
+        images=all_images if all_images else None,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    )
+
+    prompt_images = []
+    for conv in prompt_conversations:
+        imgs, _ = process_vision_info(conv)
+        if imgs:
+            prompt_images.extend(imgs)
+
+    prompt_inputs = processor(
+        text=prompt_texts,
+        images=prompt_images if prompt_images else None,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    )
+
+    labels = inputs["input_ids"].clone()
+    for i in range(len(batch)):
+        prompt_len = prompt_inputs["attention_mask"][i].sum().item()
+        labels[i, :prompt_len] = -100
+    labels[inputs["attention_mask"] == 0] = -100
+
+    # === DPA path: process target and rendered images separately ===
     target_image_inputs, _ = process_vision_info(
         [{"role": "user", "content": [{"type": "image", "image": s["target_img"]}]} for s in batch]
     )
@@ -221,39 +329,19 @@ def collate_diffcode(batch, processor, max_length=1024):
         padding=True,
     )
 
-    # Text-only tokenization (DiffCodeModel injects images via DPA, not VL path)
-    full_texts = [f"{s['prompt']}\n```\n{s['target_code']}\n```" for s in batch]
-    prompt_texts = [f"{s['prompt']}\n```\n" for s in batch]
-
-    text_encoding = processor.tokenizer(
-        full_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-    )
-    prompt_encoding = processor.tokenizer(
-        prompt_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-    )
-
-    labels = text_encoding["input_ids"].clone()
-    for i in range(len(batch)):
-        prompt_len = prompt_encoding["attention_mask"][i].sum().item()
-        labels[i, :prompt_len] = -100
-    labels[text_encoding["attention_mask"] == 0] = -100
-
     return {
+        # VL path inputs (image tokens in input_ids)
+        "input_ids": inputs["input_ids"],
+        "attention_mask": inputs["attention_mask"],
+        "pixel_values": inputs.get("pixel_values"),
+        "image_grid_thw": inputs.get("image_grid_thw"),
+        "labels": labels,
+        # DPA path inputs (separate images for diff computation)
         "target_pixel_values": target_processed.get("pixel_values"),
         "target_grid_thw": target_processed.get("image_grid_thw"),
         "rendered_pixel_values": rendered_processed.get("pixel_values"),
         "rendered_grid_thw": rendered_processed.get("image_grid_thw"),
-        "input_ids": text_encoding["input_ids"],
-        "attention_mask": text_encoding["attention_mask"],
-        "labels": labels,
+        # Metadata
         "error_types": error_types,
         "target_codes": target_codes,
     }
@@ -326,15 +414,20 @@ def train_baseline_step(model, batch, device):
 
 def train_diffcode_step(model, batch, device):
     """Single training step for DiffCode model."""
-    outputs = model(
-        target_pixel_values=batch["target_pixel_values"].to(device, dtype=torch.bfloat16),
-        target_grid_thw=batch["target_grid_thw"].to(device),
-        rendered_pixel_values=batch["rendered_pixel_values"].to(device, dtype=torch.bfloat16),
-        rendered_grid_thw=batch["rendered_grid_thw"].to(device),
+    kwargs = dict(
         input_ids=batch["input_ids"].to(device),
         attention_mask=batch["attention_mask"].to(device),
         labels=batch["labels"].to(device),
+        # VL path: image tokens in conversation (same as baseline)
+        pixel_values=batch["pixel_values"].to(device, dtype=torch.bfloat16) if batch.get("pixel_values") is not None else None,
+        image_grid_thw=batch["image_grid_thw"].to(device) if batch.get("image_grid_thw") is not None else None,
+        # DPA path: separate target/rendered for diff tokens
+        target_pixel_values=batch["target_pixel_values"].to(device, dtype=torch.bfloat16) if batch.get("target_pixel_values") is not None else None,
+        target_grid_thw=batch["target_grid_thw"].to(device) if batch.get("target_grid_thw") is not None else None,
+        rendered_pixel_values=batch["rendered_pixel_values"].to(device, dtype=torch.bfloat16) if batch.get("rendered_pixel_values") is not None else None,
+        rendered_grid_thw=batch["rendered_grid_thw"].to(device) if batch.get("rendered_grid_thw") is not None else None,
     )
+    outputs = model(**kwargs)
     return outputs["loss"]
 
 
@@ -365,7 +458,8 @@ def train(args):
     # Create dataset
     print(f"Loading data from {args.data_dir}...")
     dataset = RefinementDataset(args.data_dir, processor, max_length=args.max_length,
-                                no_error_description=args.no_error_description)
+                                no_error_description=args.no_error_description,
+                                prompt_mode=args.prompt_mode)
     print(f"Total samples: {len(dataset)}")
 
     # Train/val split
@@ -550,6 +644,9 @@ def parse_args():
     # Prompt
     parser.add_argument("--no_error_description", action="store_true",
                         help="Remove error_description from prompt (hard condition)")
+    parser.add_argument("--prompt_mode", type=str, default=None,
+                        choices=["super-hard", "hard", "hard+hints", "easy"],
+                        help="Prompt ablation mode (overrides --no_error_description)")
 
     # Dry-run
     parser.add_argument("--dry_run", action="store_true", help="Run 1 step only to verify pipeline")
