@@ -462,14 +462,34 @@ def train(args):
                                 prompt_mode=args.prompt_mode)
     print(f"Total samples: {len(dataset)}")
 
-    # Train/val split
-    val_size = max(1, int(len(dataset) * args.val_ratio))
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(
-        dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed),
-    )
-    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    # Template-level train/val split (prevents data leakage from shared templates)
+    import hashlib
+    import random as _random
+    from collections import defaultdict
+
+    template_groups = defaultdict(list)
+    for i in range(len(dataset)):
+        sample = dataset.samples[i]
+        original = sample.get('original_svg') or sample.get('original_html') or sample.get('original_code')
+        h = hashlib.md5(original.encode()).hexdigest()
+        template_groups[h].append(i)
+
+    rng = _random.Random(args.seed)
+    templates = sorted(template_groups.keys())
+    rng.shuffle(templates)
+    n_val_templates = max(1, int(len(templates) * args.val_ratio))
+    val_templates = set(templates[:n_val_templates])
+    train_templates = set(templates[n_val_templates:])
+
+    val_indices = [i for t in val_templates for i in template_groups[t]]
+    train_indices = [i for t in train_templates for i in template_groups[t]]
+
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
+
+    print(f"Template-level split: {len(train_templates)} train templates ({len(train_indices)} samples) "
+          f"/ {len(val_templates)} val templates ({len(val_indices)} samples)")
+    print(f"Template overlap (must be 0): {len(train_templates & val_templates)}")
 
     if args.enable_dpa:
         collate = lambda batch: collate_diffcode(batch, processor, args.max_length)
