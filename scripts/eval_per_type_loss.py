@@ -83,9 +83,10 @@ def main(args):
 
     # Load dataset (same settings as training: hard mode)
     from scripts.train import RefinementDataset, collate_baseline
+    # Use no_error_description=True for "hard" mode (compatible with all versions)
     dataset = RefinementDataset(
         args.data_dir, processor, max_length=args.max_length,
-        prompt_mode="hard",
+        no_error_description=True,
     )
 
     # Reproduce train/val split (same seed=42, val_ratio=0.2)
