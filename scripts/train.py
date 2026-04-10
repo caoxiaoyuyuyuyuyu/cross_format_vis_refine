@@ -71,6 +71,10 @@ class RefinementDataset(Dataset):
         with open(metadata_path) as f:
             self.samples = json.load(f)
 
+        # Store original indices for image file lookup
+        for i, s in enumerate(self.samples):
+            s["_orig_idx"] = i
+
         self.original_imgs_dir = self.data_dir / "original_imgs"
         self.perturbed_imgs_dir = self.data_dir / "perturbed_imgs"
 
@@ -80,8 +84,9 @@ class RefinementDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
 
-        # Load images
-        img_name = f"{idx:05d}.png"
+        # Load images (use original index for filename)
+        orig_idx = sample.get("_orig_idx", idx)
+        img_name = f"{orig_idx:05d}.png"
         target_img_path = self.original_imgs_dir / img_name
         rendered_img_path = self.perturbed_imgs_dir / img_name
 
@@ -347,6 +352,44 @@ def collate_diffcode(batch, processor, max_length=1024):
     }
 
 
+def parse_loss_reweight(reweight_str):
+    """Parse loss reweight string like 'element:5,position:2' into a dict."""
+    if not reweight_str:
+        return None
+    weights = {}
+    for pair in reweight_str.split(","):
+        etype, w = pair.strip().split(":")
+        weights[etype.strip()] = float(w.strip())
+    return weights
+
+
+def compute_weighted_loss(logits, labels, error_types, reweight_map, filter_types=None):
+    """Token-level weighted cross-entropy loss.
+
+    Weight is applied at token level: sum(token_loss_i * w_i) / sum(token_count_i * w_i).
+    If filter_types is set, non-matching samples get w=0 (skipped).
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    bs = shift_logits.size(0)
+    weighted_loss_sum = torch.tensor(0.0, device=logits.device)
+    weighted_count_sum = torch.tensor(0.0, device=logits.device)
+    for i in range(bs):
+        # Determine weight
+        if filter_types and error_types[i] not in filter_types:
+            continue  # skip non-matching samples entirely
+        w = reweight_map.get(error_types[i], 1.0) if reweight_map else 1.0
+        # Per-token loss (no reduction)
+        token_losses = F.cross_entropy(
+            shift_logits[i], shift_labels[i], ignore_index=-100, reduction="none"
+        )
+        valid_count = (shift_labels[i] != -100).sum().float()
+        weighted_loss_sum = weighted_loss_sum + token_losses.sum() * w
+        weighted_count_sum = weighted_count_sum + valid_count * w
+    return weighted_loss_sum / weighted_count_sum.clamp(min=1.0)
+
+
 def create_baseline_model(args):
     """Create baseline model: Qwen2.5-VL + LoRA only (no DPA)."""
     from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
@@ -394,13 +437,23 @@ def create_diffcode_model(args):
     return model, model.processor
 
 
-def train_baseline_step(model, batch, device):
+def train_baseline_step(model, batch, device, reweight_map=None, filter_types=None):
     """Single training step for baseline model."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     labels = batch["labels"].to(device)
     pixel_values = batch["pixel_values"].to(device, dtype=torch.bfloat16)
     grid_thw = batch["image_grid_thw"].to(device)
+
+    if reweight_map or filter_types:
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=grid_thw,
+        )
+        return compute_weighted_loss(outputs.logits, labels, batch["error_types"],
+                                     reweight_map, filter_types)
 
     outputs = model(
         input_ids=input_ids,
@@ -412,12 +465,13 @@ def train_baseline_step(model, batch, device):
     return outputs.loss
 
 
-def train_diffcode_step(model, batch, device):
+def train_diffcode_step(model, batch, device, reweight_map=None, filter_types=None):
     """Single training step for DiffCode model."""
+    labels = batch["labels"].to(device)
     kwargs = dict(
         input_ids=batch["input_ids"].to(device),
         attention_mask=batch["attention_mask"].to(device),
-        labels=batch["labels"].to(device),
+        labels=labels,
         # VL path: image tokens in conversation (same as baseline)
         pixel_values=batch["pixel_values"].to(device, dtype=torch.bfloat16) if batch.get("pixel_values") is not None else None,
         image_grid_thw=batch["image_grid_thw"].to(device) if batch.get("image_grid_thw") is not None else None,
@@ -428,6 +482,16 @@ def train_diffcode_step(model, batch, device):
         rendered_grid_thw=batch["rendered_grid_thw"].to(device) if batch.get("rendered_grid_thw") is not None else None,
     )
     outputs = model(**kwargs)
+    if reweight_map or filter_types:
+        logits = outputs["logits"]
+        S_diff = logits.size(1) - labels.size(1)
+        if S_diff > 0:
+            diff_labels = torch.full((labels.size(0), S_diff), -100, device=labels.device, dtype=labels.dtype)
+            combined_labels = torch.cat([diff_labels, labels], dim=1)
+        else:
+            combined_labels = labels
+        return compute_weighted_loss(logits, combined_labels, batch["error_types"],
+                                     reweight_map, filter_types)
     return outputs["loss"]
 
 
@@ -453,14 +517,44 @@ def train(args):
         print("Creating baseline model (LoRA only)...")
         model, processor = create_baseline_model(args)
 
+    # Resume from existing LoRA checkpoint
+    if args.resume_from:
+        resume_path = Path(args.resume_from)
+        print(f"Resuming from checkpoint: {resume_path}")
+        if args.enable_dpa:
+            from peft import PeftModel
+            lora_path = resume_path / "lora" if (resume_path / "lora").exists() else resume_path
+            model.base_model = PeftModel.from_pretrained(
+                model.base_model.get_base_model(), str(lora_path), is_trainable=True
+            )
+            dpa_path = resume_path / "dpa.pt"
+            if dpa_path.exists():
+                model.dpa.load_state_dict(torch.load(dpa_path, map_location="cpu"))
+                print(f"  Loaded DPA weights from {dpa_path}")
+        else:
+            from peft import PeftModel
+            lora_path = resume_path / "lora" if (resume_path / "lora").exists() else resume_path
+            base = model.get_base_model()
+            model = PeftModel.from_pretrained(base, str(lora_path), is_trainable=True)
+        print(f"  Loaded LoRA weights")
+
     model = model.to(device)
 
-    # Create dataset
+    # Parse loss reweight config
+    reweight_map = parse_loss_reweight(args.loss_reweight)
+    if reweight_map:
+        print(f"Loss reweight: {reweight_map}")
+
+    # Create dataset (always full data; filtering happens in train loop via loss masking)
     print(f"Loading data from {args.data_dir}...")
+    train_filter_types = args.filter_error_types.split(",") if args.filter_error_types else None
     dataset = RefinementDataset(args.data_dir, processor, max_length=args.max_length,
                                 no_error_description=args.no_error_description,
                                 prompt_mode=args.prompt_mode)
     print(f"Total samples: {len(dataset)}")
+    if train_filter_types:
+        n_match = sum(1 for s in dataset.samples if s.get("error_type", "unknown") in train_filter_types)
+        print(f"Train filter active: {train_filter_types} → {n_match}/{len(dataset)} samples will contribute to train loss")
 
     # Template-level train/val split (prevents data leakage from shared templates)
     import hashlib
@@ -505,10 +599,14 @@ def train(args):
     )
 
     # Optimizer
+    effective_lr = args.lr
+    if args.stage2_lr_decay:
+        effective_lr = args.lr * args.stage2_lr_decay
+        print(f"Stage-2 LR decay: {args.lr} × {args.stage2_lr_decay} = {effective_lr:.2e}")
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable_params,
-        lr=args.lr,
+        lr=effective_lr,
         weight_decay=args.weight_decay,
     )
 
@@ -531,7 +629,7 @@ def train(args):
         print("\n=== DRY RUN: 1 step ===")
         model.train()
         batch = next(iter(train_loader))
-        loss = step_fn(model, batch, device)
+        loss = step_fn(model, batch, device, reweight_map, train_filter_types)
         loss.backward()
         optimizer.step()
         print(f"Loss: {loss.item():.4f}")
@@ -550,7 +648,7 @@ def train(args):
 
         for batch_idx, batch in enumerate(train_loader):
             optimizer.zero_grad()
-            loss = step_fn(model, batch, device)
+            loss = step_fn(model, batch, device, reweight_map, train_filter_types)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
@@ -578,12 +676,12 @@ def train(args):
         epoch_time = time.time() - epoch_start
         train_avg_loss = epoch_loss / len(train_loader)
 
-        # Validation
+        # Validation (always unweighted, all error types, for fair comparison)
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                loss = step_fn(model, batch, device)
+                loss = step_fn(model, batch, device, None, None)
                 val_loss += loss.item()
         val_avg_loss = val_loss / max(1, len(val_loader))
 
@@ -626,8 +724,80 @@ def train(args):
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
     print(f"Outputs saved to: {args.output_dir}")
 
+    # Post-train per-error-type eval on full val set
+    print(f"\n{'='*60}")
+    print("Post-train 6-class per-error-type evaluation (unweighted, full val)")
+    print(f"{'='*60}")
+    from collections import defaultdict
+    type_losses = defaultdict(list)
+    type_counts = defaultdict(int)
+    model.eval()
+    with torch.no_grad():
+        for batch in val_loader:
+            labels = batch["labels"].to(device)
+            error_types = batch["error_types"]
+            if args.enable_dpa:
+                kwargs = dict(
+                    input_ids=batch["input_ids"].to(device),
+                    attention_mask=batch["attention_mask"].to(device),
+                    labels=labels,
+                    pixel_values=batch["pixel_values"].to(device, dtype=torch.bfloat16) if batch.get("pixel_values") is not None else None,
+                    image_grid_thw=batch["image_grid_thw"].to(device) if batch.get("image_grid_thw") is not None else None,
+                    target_pixel_values=batch["target_pixel_values"].to(device, dtype=torch.bfloat16) if batch.get("target_pixel_values") is not None else None,
+                    target_grid_thw=batch["target_grid_thw"].to(device) if batch.get("target_grid_thw") is not None else None,
+                    rendered_pixel_values=batch["rendered_pixel_values"].to(device, dtype=torch.bfloat16) if batch.get("rendered_pixel_values") is not None else None,
+                    rendered_grid_thw=batch["rendered_grid_thw"].to(device) if batch.get("rendered_grid_thw") is not None else None,
+                )
+                outputs = model(**kwargs)
+                logits = outputs["logits"]
+                S_diff = logits.size(1) - labels.size(1)
+                if S_diff > 0:
+                    diff_labels = torch.full((labels.size(0), S_diff), -100, device=labels.device, dtype=labels.dtype)
+                    eval_labels = torch.cat([diff_labels, labels], dim=1)
+                else:
+                    eval_labels = labels
+            else:
+                outputs = model(
+                    input_ids=batch["input_ids"].to(device),
+                    attention_mask=batch["attention_mask"].to(device),
+                    pixel_values=batch["pixel_values"].to(device, dtype=torch.bfloat16),
+                    image_grid_thw=batch["image_grid_thw"].to(device),
+                )
+                logits = outputs.logits
+                eval_labels = labels
+
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = eval_labels[..., 1:].contiguous()
+            for i in range(shift_logits.size(0)):
+                token_losses = F.cross_entropy(
+                    shift_logits[i], shift_labels[i], ignore_index=-100, reduction="none"
+                )
+                valid = (shift_labels[i] != -100)
+                if valid.sum() > 0:
+                    sample_loss = token_losses[valid].mean().item()
+                    type_losses[error_types[i]].append(sample_loss)
+                    type_counts[error_types[i]] += 1
+
+    print(f"\n{'Type':<12} {'Count':>6} {'Mean Loss':>10} {'Std':>10}")
+    print("-" * 42)
+    per_type_results = {}
+    for etype in sorted(type_losses.keys()):
+        losses = type_losses[etype]
+        import numpy as np
+        mean_l = np.mean(losses)
+        std_l = np.std(losses)
+        print(f"{etype:<12} {len(losses):>6} {mean_l:>10.4f} {std_l:>10.4f}")
+        per_type_results[etype] = {"mean_loss": float(mean_l), "std": float(std_l), "n": len(losses)}
+
+    # Save per-type results
+    with open(Path(args.output_dir) / "per_type_eval.json", "w") as f:
+        json.dump(per_type_results, f, indent=2)
+    print(f"\nPer-type results saved to {args.output_dir}/per_type_eval.json")
+
     if args.wandb_project:
         import wandb
+        for etype, res in per_type_results.items():
+            wandb.log({f"eval/{etype}_loss": res["mean_loss"]})
         wandb.finish()
 
 
@@ -667,6 +837,16 @@ def parse_args():
     parser.add_argument("--prompt_mode", type=str, default=None,
                         choices=["super-hard", "hard", "hard+hints", "easy"],
                         help="Prompt ablation mode (overrides --no_error_description)")
+
+    # Exp-4a: loss reweight & stage-2 fine-tuning
+    parser.add_argument("--loss_reweight", type=str, default=None,
+                        help="Per-error-type loss reweight, e.g. 'element:5,position:2'")
+    parser.add_argument("--filter_error_types", type=str, default=None,
+                        help="Train-only filter: only these error types contribute to loss (val uses all types)")
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Path to checkpoint dir to resume from (loads LoRA + optional DPA weights)")
+    parser.add_argument("--stage2_lr_decay", type=float, default=None,
+                        help="Stage-2 LR multiplier (e.g. 0.2 = lr/5). Applied on top of --lr.")
 
     # Dry-run
     parser.add_argument("--dry_run", action="store_true", help="Run 1 step only to verify pipeline")
