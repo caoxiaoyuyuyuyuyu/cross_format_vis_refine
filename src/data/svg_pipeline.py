@@ -438,56 +438,341 @@ class SVGPipeline:
             return []
 
     @staticmethod
-    def synthetic_svgs() -> List[str]:
-        """Generate a small set of synthetic SVGs for testing."""
-        samples = [
-            # Simple rect + circle
-            '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">'
-            '<rect x="10" y="10" width="80" height="60" fill="#ff0000" stroke="#000000" stroke-width="2"/>'
-            '<circle cx="150" cy="100" r="40" fill="#00ff00" stroke="#333333"/>'
-            '<text x="50" y="180" fill="#0000ff" font-size="14">Hello SVG</text>'
-            '</svg>',
-            # Multiple rects
-            '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">'
-            '<rect x="20" y="20" width="100" height="100" fill="#3498db"/>'
-            '<rect x="140" y="20" width="96" height="96" fill="#e74c3c" rx="10"/>'
-            '<rect x="80" y="140" width="96" height="96" fill="#2ecc71"/>'
-            '</svg>',
-            # Path + ellipse
-            '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">'
-            '<ellipse cx="100" cy="80" rx="60" ry="40" fill="#f39c12" stroke="#000" stroke-width="1"/>'
-            '<path d="M 20 180 L 100 120 L 180 180 Z" fill="#9b59b6"/>'
-            '<rect x="70" y="150" width="60" height="30" fill="#1abc9c"/>'
-            '</svg>',
-            # Icon-like: simple star
-            '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">'
-            '<polygon points="100,10 40,198 190,78 10,78 160,198" fill="#f1c40f" stroke="#e67e22" stroke-width="3"/>'
-            '</svg>',
-            # Grid of circles
-            '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">'
-            '<circle cx="50" cy="50" r="30" fill="#e74c3c"/>'
-            '<circle cx="150" cy="50" r="30" fill="#3498db"/>'
-            '<circle cx="50" cy="150" r="30" fill="#2ecc71"/>'
-            '<circle cx="150" cy="150" r="30" fill="#9b59b6"/>'
-            '</svg>',
-            # Text-heavy: labeled bar chart
-            '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">'
-            '<rect x="30" y="100" width="40" height="120" fill="#3498db" stroke="#2c3e50" stroke-width="1"/>'
-            '<rect x="90" y="60" width="40" height="160" fill="#e74c3c" stroke="#2c3e50" stroke-width="1"/>'
-            '<rect x="150" y="130" width="40" height="90" fill="#2ecc71" stroke="#2c3e50" stroke-width="1"/>'
-            '<text x="50" y="240" font-size="12" fill="#333" text-anchor="middle" font-family="serif">Alpha</text>'
-            '<text x="110" y="240" font-size="12" fill="#333" text-anchor="middle" font-family="serif">Beta</text>'
-            '<text x="170" y="240" font-size="12" fill="#333" text-anchor="middle" font-family="serif">Gamma</text>'
-            '<text x="128" y="30" font-size="16" fill="#000" text-anchor="middle" font-family="sans-serif">Results</text>'
-            '</svg>',
-            # Text + styled shapes
-            '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">'
-            '<rect x="10" y="10" width="180" height="180" fill="none" stroke="#333" stroke-width="2" stroke-dasharray="5 3"/>'
-            '<circle cx="100" cy="80" r="35" fill="#e67e22" stroke="#d35400" stroke-width="2"/>'
-            '<text x="100" y="85" font-size="20" fill="#fff" text-anchor="middle" font-family="monospace">42</text>'
-            '<text x="100" y="150" font-size="14" fill="#555" text-anchor="middle">Answer</text>'
-            '</svg>',
+    def synthetic_svgs(num_templates: int = 500) -> List[str]:
+        """Generate diverse synthetic SVGs procedurally.
+
+        Produces structurally unique SVGs by combining different element types,
+        counts, and layout patterns. Each call generates `num_templates` SVGs.
+        """
+        import math
+
+        COLORS = [
+            "#e74c3c", "#3498db", "#2ecc71", "#9b59b6", "#f1c40f",
+            "#e67e22", "#1abc9c", "#34495e", "#c0392b", "#2980b9",
+            "#27ae60", "#8e44ad", "#f39c12", "#d35400", "#16a085",
+            "#ff6b6b", "#4ecdc4", "#45b7d1", "#96ceb4", "#ffeaa7",
+            "#dfe6e9", "#636e72", "#fd79a8", "#6c5ce7", "#00b894",
         ]
+        STROKE_COLORS = ["#000000", "#333333", "#2c3e50", "#555555", "none"]
+        FONTS = ["serif", "sans-serif", "monospace", "cursive"]
+        WORDS = [
+            "Alpha", "Beta", "Gamma", "Delta", "Hello", "World", "Test",
+            "Data", "Node", "Edge", "Peak", "Flow", "Core", "Link", "Wave",
+            "Grid", "Axis", "Plot", "Item", "Cell", "Loop", "Path", "Area",
+            "100", "42", "7.5", "OK", "A", "B", "C", "X", "Y", "Z",
+        ]
+
+        # Element generators (each returns an SVG element string)
+        def _rect(x, y, w, h, fill, stroke="none", sw=1, rx=0):
+            rx_attr = f' rx="{rx}"' if rx else ""
+            sw_attr = f' stroke="{stroke}" stroke-width="{sw}"' if stroke != "none" else ""
+            return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"{sw_attr}{rx_attr}/>'
+
+        def _circle(cx, cy, r, fill, stroke="none", sw=1):
+            sw_attr = f' stroke="{stroke}" stroke-width="{sw}"' if stroke != "none" else ""
+            return f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="{fill}"{sw_attr}/>'
+
+        def _ellipse(cx, cy, rx, ry, fill, stroke="none", sw=1):
+            sw_attr = f' stroke="{stroke}" stroke-width="{sw}"' if stroke != "none" else ""
+            return f'<ellipse cx="{cx}" cy="{cy}" rx="{rx}" ry="{ry}" fill="{fill}"{sw_attr}/>'
+
+        def _line(x1, y1, x2, y2, stroke, sw=2):
+            return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{stroke}" stroke-width="{sw}"/>'
+
+        def _polygon(points_str, fill, stroke="none", sw=1):
+            sw_attr = f' stroke="{stroke}" stroke-width="{sw}"' if stroke != "none" else ""
+            return f'<polygon points="{points_str}" fill="{fill}"{sw_attr}/>'
+
+        def _path(d, fill, stroke="none", sw=1):
+            fill_attr = f'fill="{fill}"'
+            sw_attr = f' stroke="{stroke}" stroke-width="{sw}"' if stroke != "none" else ""
+            return f'<path d="{d}" {fill_attr}{sw_attr}/>'
+
+        def _text(x, y, content, fill="#333", font_size=14, font_family="serif", anchor="middle"):
+            return (f'<text x="{x}" y="{y}" font-size="{font_size}" fill="{fill}" '
+                    f'text-anchor="{anchor}" font-family="{font_family}">{content}</text>')
+
+        def _random_triangle(cx, cy, size):
+            pts = []
+            for a in [0, 120, 240]:
+                rad = math.radians(a - 90)
+                pts.append(f"{cx + size * math.cos(rad):.0f},{cy + size * math.sin(rad):.0f}")
+            return " ".join(pts)
+
+        def _random_polygon_pts(cx, cy, r, n_sides):
+            pts = []
+            for i in range(n_sides):
+                angle = 2 * math.pi * i / n_sides - math.pi / 2
+                pts.append(f"{cx + r * math.cos(angle):.0f},{cy + r * math.sin(angle):.0f}")
+            return " ".join(pts)
+
+        # Layout generators: each returns a list of element strings
+        def gen_scattered_shapes(rng):
+            """2-8 random shapes scattered across the canvas."""
+            n = rng.randint(2, 8)
+            elems = []
+            shape_types = ["rect", "circle", "ellipse", "polygon", "line"]
+            for _ in range(n):
+                st = rng.choice(shape_types)
+                c = rng.choice(COLORS)
+                sc = rng.choice(STROKE_COLORS)
+                if st == "rect":
+                    x, y = rng.randint(10, 180), rng.randint(10, 180)
+                    w, h = rng.randint(20, 80), rng.randint(20, 80)
+                    rx = rng.choice([0, 0, 5, 10])
+                    elems.append(_rect(x, y, w, h, c, sc, rng.randint(1, 3), rx))
+                elif st == "circle":
+                    cx, cy = rng.randint(30, 220), rng.randint(30, 220)
+                    r = rng.randint(10, 50)
+                    elems.append(_circle(cx, cy, r, c, sc))
+                elif st == "ellipse":
+                    cx, cy = rng.randint(30, 220), rng.randint(30, 220)
+                    rx, ry = rng.randint(15, 60), rng.randint(10, 40)
+                    elems.append(_ellipse(cx, cy, rx, ry, c, sc))
+                elif st == "polygon":
+                    cx, cy = rng.randint(40, 210), rng.randint(40, 210)
+                    r = rng.randint(15, 50)
+                    sides = rng.choice([3, 5, 6])
+                    pts = _random_polygon_pts(cx, cy, r, sides)
+                    elems.append(_polygon(pts, c, sc, rng.randint(1, 2)))
+                else:  # line
+                    elems.append(_line(rng.randint(5, 240), rng.randint(5, 240),
+                                       rng.randint(5, 240), rng.randint(5, 240),
+                                       sc if sc != "none" else c, rng.randint(1, 3)))
+            return elems
+
+        def gen_grid(rng):
+            """2x2, 2x3, 3x2, or 3x3 grid with mixed element types."""
+            cols = rng.choice([2, 3])
+            rows = rng.choice([2, 3])
+            cell_types = ["rect", "circle", "ellipse", "polygon"]
+            # Either uniform or mixed types per cell
+            mixed = rng.random() > 0.3
+            base_type = rng.choice(cell_types)
+            gap = 256 // (max(cols, rows) + 1)
+            elems = []
+            for r in range(rows):
+                for c_idx in range(cols):
+                    color = rng.choice(COLORS)
+                    sc = rng.choice(STROKE_COLORS)
+                    x = gap * (c_idx + 1) - gap // 3
+                    y = gap * (r + 1) - gap // 3
+                    st = rng.choice(cell_types) if mixed else base_type
+                    if st == "rect":
+                        elems.append(_rect(x, y, gap // 2, gap // 2, color, sc))
+                    elif st == "circle":
+                        elems.append(_circle(x + gap // 4, y + gap // 4, gap // 4, color, sc))
+                    elif st == "ellipse":
+                        elems.append(_ellipse(x + gap // 4, y + gap // 4,
+                                              gap // 3, gap // 5, color, sc))
+                    else:
+                        pts = _random_polygon_pts(x + gap // 4, y + gap // 4,
+                                                   gap // 4, rng.choice([3, 5, 6]))
+                        elems.append(_polygon(pts, color, sc))
+            # Optional title
+            if rng.random() > 0.5:
+                elems.append(_text(128, 20, rng.choice(WORDS), rng.choice(COLORS),
+                                   rng.choice([12, 14, 16]), rng.choice(FONTS)))
+            return elems
+
+        def gen_bar_chart(rng):
+            """Bar chart with 2-6 bars and optional labels."""
+            n_bars = rng.randint(2, 6)
+            bar_w = max(15, 200 // n_bars - 10)
+            elems = []
+            for i in range(n_bars):
+                h = rng.randint(30, 180)
+                x = 20 + i * (bar_w + 8)
+                y = 230 - h
+                color = rng.choice(COLORS)
+                sc = rng.choice(STROKE_COLORS[:3])
+                elems.append(_rect(x, y, bar_w, h, color, sc, 1))
+                if rng.random() > 0.3:
+                    label = rng.choice(WORDS)
+                    elems.append(_text(x + bar_w // 2, 248, label, font_size=rng.choice([10, 12])))
+            if rng.random() > 0.5:
+                elems.append(_text(128, 20, rng.choice(WORDS), font_size=16, font_family="sans-serif"))
+            return elems
+
+        def gen_concentric(rng):
+            """2-5 concentric circles or ellipses, optionally with label/line."""
+            n = rng.randint(2, 5)
+            cx, cy = rng.randint(80, 170), rng.randint(80, 170)
+            max_r = rng.randint(50, 90)
+            elems = []
+            for i in range(n):
+                r = max_r - i * (max_r // n)
+                if r < 5:
+                    break
+                color = rng.choice(COLORS)
+                shape = rng.choice(["circle", "ellipse"])
+                if shape == "circle":
+                    elems.append(_circle(cx, cy, r, color, rng.choice(STROKE_COLORS)))
+                else:
+                    elems.append(_ellipse(cx, cy, r, int(r * rng.uniform(0.5, 0.9)), color))
+            # Optionally add a label or crosshair
+            if rng.random() > 0.5:
+                elems.append(_text(cx, cy, rng.choice(WORDS), rng.choice(COLORS),
+                                   rng.choice([10, 12, 14]), rng.choice(FONTS)))
+            if rng.random() > 0.6:
+                elems.append(_line(cx - max_r, cy, cx + max_r, cy,
+                                   rng.choice(STROKE_COLORS[:3]), 1))
+            return elems
+
+        def gen_polygon_scene(rng):
+            """1-4 polygons with optional labels and decorative elements."""
+            n = rng.randint(1, 4)
+            elems = []
+            for _ in range(n):
+                cx, cy = rng.randint(40, 210), rng.randint(40, 210)
+                r = rng.randint(20, 60)
+                sides = rng.choice([3, 4, 5, 6, 8])
+                pts = _random_polygon_pts(cx, cy, r, sides)
+                color = rng.choice(COLORS)
+                sc = rng.choice(STROKE_COLORS)
+                elems.append(_polygon(pts, color, sc, rng.randint(1, 3)))
+                if rng.random() > 0.6:
+                    elems.append(_text(cx, cy, rng.choice(WORDS), rng.choice(COLORS),
+                                       rng.choice([10, 12]), rng.choice(FONTS)))
+            if rng.random() > 0.5:
+                elems.append(_line(rng.randint(5, 50), rng.randint(5, 240),
+                                   rng.randint(200, 250), rng.randint(5, 240),
+                                   rng.choice(STROKE_COLORS[:3]), rng.randint(1, 2)))
+            return elems
+
+        def gen_path_scene(rng):
+            """1-4 paths with optional shapes and labels."""
+            path_templates = [
+                lambda: f"M {rng.randint(10,80)} {rng.randint(150,230)} L {rng.randint(80,170)} {rng.randint(30,100)} L {rng.randint(170,240)} {rng.randint(150,230)} Z",
+                lambda: f"M {rng.randint(10,50)} {rng.randint(100,200)} Q {rng.randint(100,150)} {rng.randint(10,60)} {rng.randint(190,240)} {rng.randint(100,200)}",
+                lambda: f"M {rng.randint(10,30)} {rng.randint(120,180)} L {rng.randint(60,80)} {rng.randint(40,80)} L {rng.randint(120,160)} {rng.randint(120,180)} L {rng.randint(180,220)} {rng.randint(40,80)}",
+                lambda: f"M {rng.randint(10,50)} {rng.randint(10,50)} C {rng.randint(60,120)} {rng.randint(60,120)} {rng.randint(130,190)} {rng.randint(60,120)} {rng.randint(200,240)} {rng.randint(10,50)}",
+            ]
+            n = rng.randint(1, 4)
+            elems = []
+            for _ in range(n):
+                d = rng.choice(path_templates)()
+                color = rng.choice(COLORS)
+                sc = rng.choice(STROKE_COLORS)
+                elems.append(_path(d, color, sc, rng.randint(1, 3)))
+            # Optionally mix in a shape or text
+            if rng.random() > 0.5:
+                c = rng.choice(COLORS)
+                elems.append(_circle(rng.randint(30, 220), rng.randint(30, 220),
+                                     rng.randint(5, 20), c))
+            if rng.random() > 0.6:
+                elems.append(_text(rng.randint(20, 200), rng.randint(20, 240),
+                                   rng.choice(WORDS), rng.choice(COLORS),
+                                   rng.choice([10, 12]), rng.choice(FONTS)))
+            return elems
+
+        def gen_lines_and_shapes(rng):
+            """Mix of lines and basic shapes."""
+            elems = []
+            n_lines = rng.randint(1, 4)
+            for _ in range(n_lines):
+                elems.append(_line(
+                    rng.randint(10, 240), rng.randint(10, 240),
+                    rng.randint(10, 240), rng.randint(10, 240),
+                    rng.choice(COLORS), rng.randint(1, 4),
+                ))
+            n_shapes = rng.randint(1, 3)
+            for _ in range(n_shapes):
+                c = rng.choice(COLORS)
+                if rng.random() > 0.5:
+                    elems.append(_rect(rng.randint(10, 150), rng.randint(10, 150),
+                                       rng.randint(20, 80), rng.randint(20, 80), c))
+                else:
+                    elems.append(_circle(rng.randint(30, 220), rng.randint(30, 220),
+                                         rng.randint(10, 40), c))
+            return elems
+
+        def gen_labeled_diagram(rng):
+            """Shapes with text labels, varied element types."""
+            elems = []
+            n = rng.randint(1, 5)
+            shape_choice = rng.choice(["circle", "rect", "ellipse", "polygon", "mixed"])
+            for _ in range(n):
+                cx, cy = rng.randint(40, 210), rng.randint(40, 200)
+                c = rng.choice(COLORS)
+                sc = rng.choice(STROKE_COLORS)
+                st = rng.choice(["circle", "rect", "ellipse", "polygon"]) if shape_choice == "mixed" else shape_choice
+                if st == "circle":
+                    r = rng.randint(15, 40)
+                    elems.append(_circle(cx, cy, r, c, sc))
+                elif st == "rect":
+                    w, h = rng.randint(30, 80), rng.randint(20, 50)
+                    elems.append(_rect(cx - w // 2, cy - h // 2, w, h, c, sc, 1,
+                                       rng.choice([0, 5])))
+                elif st == "ellipse":
+                    elems.append(_ellipse(cx, cy, rng.randint(20, 50), rng.randint(12, 30), c, sc))
+                else:
+                    pts = _random_polygon_pts(cx, cy, rng.randint(15, 35), rng.choice([3, 5, 6]))
+                    elems.append(_polygon(pts, c, sc))
+                # Label (sometimes skip for variety)
+                if rng.random() > 0.2:
+                    elems.append(_text(cx, cy + 5, rng.choice(WORDS),
+                                       "#fff" if rng.random() > 0.5 else "#333",
+                                       rng.choice([10, 12, 14]), rng.choice(FONTS)))
+            # Optional connecting lines
+            if n >= 2 and rng.random() > 0.5:
+                elems.append(_line(rng.randint(30, 120), rng.randint(30, 220),
+                                   rng.randint(130, 230), rng.randint(30, 220),
+                                   rng.choice(STROKE_COLORS[:3]), 1))
+            return elems
+
+        def gen_mixed_complex(rng):
+            """3-7 elements mixing multiple types."""
+            n = rng.randint(3, 7)
+            makers = [
+                lambda: _rect(rng.randint(5, 180), rng.randint(5, 180),
+                              rng.randint(15, 90), rng.randint(15, 90),
+                              rng.choice(COLORS), rng.choice(STROKE_COLORS)),
+                lambda: _circle(rng.randint(20, 230), rng.randint(20, 230),
+                                rng.randint(8, 50), rng.choice(COLORS)),
+                lambda: _ellipse(rng.randint(30, 220), rng.randint(30, 220),
+                                 rng.randint(10, 50), rng.randint(8, 35), rng.choice(COLORS)),
+                lambda: _polygon(_random_polygon_pts(rng.randint(40, 200), rng.randint(40, 200),
+                                                      rng.randint(15, 50), rng.choice([3, 5, 6])),
+                                 rng.choice(COLORS), rng.choice(STROKE_COLORS)),
+                lambda: _text(rng.randint(20, 230), rng.randint(20, 240), rng.choice(WORDS),
+                              rng.choice(COLORS), rng.choice([10, 12, 14, 16]), rng.choice(FONTS)),
+                lambda: _line(rng.randint(5, 240), rng.randint(5, 240),
+                              rng.randint(5, 240), rng.randint(5, 240),
+                              rng.choice(COLORS), rng.randint(1, 4)),
+            ]
+            elems = []
+            for _ in range(n):
+                elems.append(rng.choice(makers)())
+            return elems
+
+        # Layout registry
+        LAYOUTS = [
+            gen_scattered_shapes,
+            gen_grid,
+            gen_bar_chart,
+            gen_concentric,
+            gen_polygon_scene,
+            gen_path_scene,
+            gen_lines_and_shapes,
+            gen_labeled_diagram,
+            gen_mixed_complex,
+        ]
+
+        # Generate diverse templates
+        samples = []
+        rng = random.Random(42)  # Deterministic for reproducibility
+        for i in range(num_templates):
+            layout_fn = LAYOUTS[i % len(LAYOUTS)]
+            # Use different seed per template for variation within same layout
+            sub_rng = random.Random(42 + i * 137)
+            elems = layout_fn(sub_rng)
+            size = sub_rng.choice([200, 224, 256])
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" '
+                   f'width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
+                   + "".join(elems) + "</svg>")
+            samples.append(svg)
+
         return samples
 
     def process_one(
@@ -571,9 +856,11 @@ class SVGPipeline:
         results: List[Dict[str, Any]] = []
         attempts = 0
         max_attempts = num_samples * 5
+        svg_idx = 0
 
         while len(results) < num_samples and attempts < max_attempts:
-            svg = random.choice(svgs)
+            svg = svgs[svg_idx % len(svgs)]
+            svg_idx += 1
             sample = self.process_one(svg)
             if sample is not None:
                 results.append(sample)
@@ -588,6 +875,9 @@ class SVGPipeline:
 
     def _save(self, results: List[Dict[str, Any]], output_dir: str):
         """Save results to disk."""
+        if not results:
+            print("[WARN] No results to save, skipping metadata write")
+            return
         out = Path(output_dir)
         (out / "original_imgs").mkdir(parents=True, exist_ok=True)
         (out / "perturbed_imgs").mkdir(parents=True, exist_ok=True)

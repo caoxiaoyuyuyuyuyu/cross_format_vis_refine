@@ -93,10 +93,10 @@ def main():
     base = PROJECT_ROOT / args.output_base
     use_hf = not args.no_hf
 
-    if not args.html_only:
+    if not args.html_only and args.num_svg > 0:
         generate_svg(args.num_svg, base / "svg", args.seed, use_hf)
 
-    if not args.svg_only:
+    if not args.svg_only and args.num_html > 0:
         generate_html(args.num_html, base / "html", args.seed + 1, use_hf)
 
     # Print summary

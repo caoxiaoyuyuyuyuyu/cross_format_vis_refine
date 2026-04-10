@@ -626,6 +626,9 @@ class HTMLPipeline:
         return results
 
     def _save(self, results, output_dir):
+        if not results:
+            print("[WARN] No results to save, skipping metadata write")
+            return
         out = Path(output_dir)
         (out / "original_imgs").mkdir(parents=True, exist_ok=True)
         (out / "perturbed_imgs").mkdir(parents=True, exist_ok=True)

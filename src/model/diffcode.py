@@ -165,50 +165,130 @@ class DiffCodeModel(nn.Module):
 
         return features
 
+    def _get_mrope_position_ids(
+        self, input_ids: Tensor, image_grid_thw: Optional[Tensor], attention_mask: Tensor,
+    ) -> Tensor:
+        """Compute 3D m-RoPE position IDs for the original sequence.
+
+        Returns:
+            position_ids: (3, B, S) tensor with [temporal, height, width] positions.
+            For text tokens all 3 dims are identical (standard 1D RoPE).
+            For image tokens dims reflect spatial grid layout.
+        """
+        base_model = self.base_model.get_base_model()
+        B, S = input_ids.shape
+        device = input_ids.device
+
+        if image_grid_thw is not None:
+            # Build mm_token_type_ids: 0=text, 1=image
+            image_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            mm_token_type_ids = torch.zeros(B, S, dtype=torch.int, device=device)
+            mm_token_type_ids[input_ids == image_token_id] = 1
+
+            position_ids, rope_deltas = base_model.model.get_rope_index(
+                input_ids=input_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=image_grid_thw,
+                attention_mask=attention_mask,
+            )
+        else:
+            # Pure text: sequential positions replicated across 3 dims
+            position_ids = torch.arange(S, device=device).view(1, 1, -1).expand(3, B, -1)
+
+        return position_ids
+
+    def _prepend_diff_positions(
+        self, position_ids: Tensor, n_diff: int, batch_size: int,
+    ) -> Tensor:
+        """Prepend text-like positions for diff tokens and shift original positions.
+
+        Diff tokens get sequential positions [0..n_diff-1] with all 3 m-RoPE
+        axes identical (like text tokens). Original positions are shifted up by n_diff.
+
+        Args:
+            position_ids: (3, B, S) original m-RoPE positions
+            n_diff: number of diff tokens to prepend
+            batch_size: batch size
+
+        Returns:
+            (3, B, n_diff + S) combined position IDs
+        """
+        device = position_ids.device
+        # Diff tokens: text-like positions [0..n_diff-1], same on all 3 axes
+        diff_pos = torch.arange(n_diff, device=device, dtype=position_ids.dtype)
+        diff_pos = diff_pos.view(1, 1, -1).expand(3, batch_size, -1)
+        # Shift original positions to make room for diff tokens
+        shifted_pos = position_ids + n_diff
+        return torch.cat([diff_pos, shifted_pos], dim=2)
+
     def forward(
         self,
-        target_pixel_values: Tensor,
-        target_grid_thw: Tensor,
-        rendered_pixel_values: Tensor,
-        rendered_grid_thw: Tensor,
         input_ids: Tensor,
         attention_mask: Tensor,
+        pixel_values: Tensor,
+        image_grid_thw: Tensor,
         labels: Optional[Tensor] = None,
+        target_pixel_values: Optional[Tensor] = None,
+        target_grid_thw: Optional[Tensor] = None,
+        rendered_pixel_values: Optional[Tensor] = None,
+        rendered_grid_thw: Optional[Tensor] = None,
     ):
-        """Full forward pass.
+        """Full forward pass: baseline VL path + DPA augmentation.
 
-        1. Encode both images through ViT, collecting hook features
-        2. DPA computes diff tokens
-        3. Prepend diff tokens to LLM input embeddings
-        4. LLM forward pass with optional loss computation
+        1. Standard VL path: embed tokens + merge image features (same as baseline)
+        2. DPA: separate ViT passes for target/rendered → diff tokens
+        3. Compute m-RoPE 3D position IDs (with diff token positions prepended)
+        4. Prepend diff tokens to VL embeddings → LLM forward with position_ids
         """
-        # Step 1: Get ViT features for both images
-        target_features = self._encode_image(target_pixel_values, target_grid_thw)
-        rendered_features = self._encode_image(rendered_pixel_values, rendered_grid_thw)
-
-        # Step 2: DPA -> diff tokens (B, S_diff, llm_hidden_dim)
-        diff_tokens = self.dpa(target_features, rendered_features)
-
-        # Step 3: Get LLM input embeddings and prepend diff tokens
         base_model = self.base_model.get_base_model()
-        text_embeds = base_model.model.language_model.embed_tokens(input_ids)  # (B, S_text, D)
-        combined_embeds = torch.cat([diff_tokens, text_embeds], dim=1)
 
-        # Extend attention mask for diff tokens
-        B, S_diff, _ = diff_tokens.shape
-        diff_attn = torch.ones(B, S_diff, device=attention_mask.device, dtype=attention_mask.dtype)
-        combined_attn = torch.cat([diff_attn, attention_mask], dim=1)
+        # Step 1: Standard VL embedding path (image tokens merged into text)
+        inputs_embeds = base_model.model.language_model.embed_tokens(input_ids)
 
-        # Extend labels if provided (mask diff token positions with -100)
-        combined_labels = None
-        if labels is not None:
-            diff_labels = torch.full((B, S_diff), -100, device=labels.device, dtype=labels.dtype)
-            combined_labels = torch.cat([diff_labels, labels], dim=1)
+        if pixel_values is not None:
+            # Mirror Qwen2_5_VLModel.forward() image embedding logic exactly
+            image_embeds = base_model.model.get_image_features(pixel_values, image_grid_thw).pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = base_model.model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        # Step 4: LLM forward
+        # Step 1b: Compute m-RoPE 3D position IDs for the original sequence
+        position_ids = self._get_mrope_position_ids(input_ids, image_grid_thw, attention_mask)
+
+        # Step 2: DPA diff tokens (separate ViT passes, pre-spatial-merge hooks)
+        if target_pixel_values is not None and rendered_pixel_values is not None:
+            target_features = self._encode_image(target_pixel_values, target_grid_thw)
+            rendered_features = self._encode_image(rendered_pixel_values, rendered_grid_thw)
+            diff_tokens = self.dpa(target_features, rendered_features)
+
+            # Step 3: Prepend diff tokens to VL embeddings
+            B, S_diff, _ = diff_tokens.shape
+            combined_embeds = torch.cat([diff_tokens, inputs_embeds], dim=1)
+
+            diff_attn = torch.ones(B, S_diff, device=attention_mask.device, dtype=attention_mask.dtype)
+            combined_attn = torch.cat([diff_attn, attention_mask], dim=1)
+
+            # Prepend diff token positions to m-RoPE position IDs
+            combined_position_ids = self._prepend_diff_positions(position_ids, S_diff, B)
+
+            combined_labels = None
+            if labels is not None:
+                diff_labels = torch.full((B, S_diff), -100, device=labels.device, dtype=labels.dtype)
+                combined_labels = torch.cat([diff_labels, labels], dim=1)
+        else:
+            # Fallback: no DPA inputs, behave like baseline
+            combined_embeds = inputs_embeds
+            combined_attn = attention_mask
+            combined_position_ids = position_ids
+            combined_labels = labels
+
+        # Step 4: LLM forward with explicit m-RoPE position IDs
         outputs = base_model.model.language_model(
             inputs_embeds=combined_embeds,
             attention_mask=combined_attn,
+            position_ids=combined_position_ids,
         )
         logits = base_model.lm_head(outputs[0])
 
@@ -223,6 +303,113 @@ class DiffCodeModel(nn.Module):
             )
 
         return {"loss": loss, "logits": logits}
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        pixel_values: Optional[Tensor] = None,
+        image_grid_thw: Optional[Tensor] = None,
+        target_pixel_values: Optional[Tensor] = None,
+        target_grid_thw: Optional[Tensor] = None,
+        rendered_pixel_values: Optional[Tensor] = None,
+        rendered_grid_thw: Optional[Tensor] = None,
+        max_new_tokens: int = 1024,
+        **generate_kwargs,
+    ) -> Tensor:
+        """Generate refined code with DPA-augmented inference.
+
+        Mirrors forward() Steps 1-3 to build combined embeddings with
+        proper m-RoPE 3D position IDs, then uses greedy autoregressive
+        decoding via the language model.
+        """
+        base_model = self.base_model.get_base_model()
+
+        # Step 1: VL embeddings (same as forward)
+        inputs_embeds = base_model.model.language_model.embed_tokens(input_ids)
+
+        if pixel_values is not None:
+            image_embeds = base_model.model.get_image_features(pixel_values, image_grid_thw).pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = base_model.model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        # Step 1b: Compute m-RoPE 3D position IDs
+        position_ids = self._get_mrope_position_ids(input_ids, image_grid_thw, attention_mask)
+
+        # Step 2: DPA diff tokens
+        if target_pixel_values is not None and rendered_pixel_values is not None:
+            target_features = self._encode_image(target_pixel_values, target_grid_thw)
+            rendered_features = self._encode_image(rendered_pixel_values, rendered_grid_thw)
+            diff_tokens = self.dpa(target_features, rendered_features)
+
+            B, S_diff, _ = diff_tokens.shape
+            combined_embeds = torch.cat([diff_tokens, inputs_embeds], dim=1)
+
+            diff_attn = torch.ones(B, S_diff, device=attention_mask.device, dtype=attention_mask.dtype)
+            combined_attn = torch.cat([diff_attn, attention_mask], dim=1)
+
+            combined_position_ids = self._prepend_diff_positions(position_ids, S_diff, B)
+        else:
+            combined_embeds = inputs_embeds
+            combined_attn = attention_mask
+            combined_position_ids = position_ids
+
+        # Step 3: Autoregressive generation via language model
+        language_model = base_model.model.language_model
+        lm_head = base_model.lm_head
+        eos_token_id = self.processor.tokenizer.eos_token_id
+        B = combined_embeds.shape[0]
+
+        generated_ids = []
+        past_key_values = None
+
+        # Track next position for decode steps (max position + 1)
+        next_pos = combined_position_ids.max(dim=2, keepdim=True).values + 1  # (3, B, 1)
+
+        # Prefill: run the full combined input through the language model
+        outputs = language_model(
+            inputs_embeds=combined_embeds,
+            attention_mask=combined_attn,
+            position_ids=combined_position_ids,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        next_logits = lm_head(outputs.last_hidden_state[:, -1:, :])
+        next_token = next_logits.argmax(dim=-1)  # (B, 1)
+        generated_ids.append(next_token)
+
+        # Decode loop
+        for _ in range(max_new_tokens - 1):
+            if (next_token == eos_token_id).all():
+                break
+
+            token_embeds = language_model.embed_tokens(next_token)
+            step_attn = torch.ones(
+                B, 1, device=combined_attn.device, dtype=combined_attn.dtype,
+            )
+            combined_attn = torch.cat([combined_attn, step_attn], dim=1)
+
+            # Text-like position: all 3 axes identical, incrementing
+            step_pos = next_pos  # (3, B, 1)
+            next_pos = next_pos + 1
+
+            outputs = language_model(
+                inputs_embeds=token_embeds,
+                attention_mask=combined_attn,
+                position_ids=step_pos,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            next_logits = lm_head(outputs.last_hidden_state[:, -1:, :])
+            next_token = next_logits.argmax(dim=-1)
+            generated_ids.append(next_token)
+
+        return torch.cat(generated_ids, dim=-1)  # (B, gen_len)
 
     def get_trainable_param_count(self) -> Dict[str, int]:
         """Return trainable parameter counts by component."""
